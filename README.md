@@ -108,6 +108,9 @@ next to your local files.
 mdbrowse therefore runs everything through **DOMPurify** before it touches the DOM.
 A `.md` from a stranger cannot run scripts, phone home, or poke at your files.
 
+Found a way around that? [`SECURITY.md`](SECURITY.md) says what counts, what doesn't,
+and how to report it privately.
+
 ## Install
 
 ```sh
