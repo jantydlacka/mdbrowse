@@ -1,0 +1,10 @@
+# OS / editor cruft
+.DS_Store
+*~
+*.swp
+
+# mdbrowse's own render cache, if someone points MDBROWSE_CACHE inside the repo
+/cache/
+
+# local scratch (notes, experiments) — never published
+/_local/

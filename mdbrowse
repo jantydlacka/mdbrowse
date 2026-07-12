@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+# mdbrowse — a zero-install, read-only Markdown viewer that renders like GitHub.
+#
+# Turns a .md file into a self-contained HTML page (bundled marked.js +
+# DOMPurify + github-markdown-css, inlined) and opens it in your browser. The
+# rendered HTML is sanitized, so a hostile .md cannot run scripts. It never
+# edits anything — it only shows.
+#
+#   mdbrowse file.md              # render and open in the browser
+#   mdbrowse --url file.md        # print the file:// URL of the rendered HTML
+#   mdbrowse --render-only f.md   # render only, print the HTML path (don't open)
+#
+# Relative links to other .md files (e.g. an index that links siblings) are
+# rewritten to the rendered HTML of their targets; targets are pre-rendered
+# recursively. Relative images are embedded as data: URIs, so the page carries
+# everything it needs.
+#
+# Environment:
+#   MDBROWSE_CACHE      output dir for rendered HTML (default: see cache_dir() below)
+#   MDBROWSE_VENDOR     dir holding the bundled assets (default: vendor/ next to this script)
+#   MDBROWSE_MAX_IMAGE  max bytes of an image to inline (default: 5 MiB; bigger ones are linked)
+#   BROWSER             browser command used to open (falls back to xdg-open)
+set -uo pipefail
+shopt -s extglob   # destpath() needs +(...) to strip a trailing "title"
+
+# --- locate ourselves (resolve symlink) so bundled vendor/ is found ----------
+_self="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then _self="$(readlink -f "$_self" 2>/dev/null || echo "$_self")"; fi
+HERE="$(cd "$(dirname "$_self")" && pwd)"
+
+VENDOR="${MDBROWSE_VENDOR:-$HERE/vendor}"
+MARKED="$VENDOR/marked.min.js"
+PURIFY="$VENDOR/purify.min.js"
+GHCSS="$VENDOR/github-markdown.css"
+
+# A Snap/Flatpak browser runs in a sandbox that cannot read hidden directories, and
+# the XDG cache ($HOME/.cache/…) is hidden. Rendering there and handing the browser a
+# path it is not allowed to open is the one way this tool can fail while looking like
+# it worked — so when the default browser is confined, keep the page somewhere it can
+# actually reach. Costs one xdg-settings call (~15 ms) and saves the user from having
+# to know any of this.
+confined_browser() {
+  local id df exec d apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  command -v xdg-settings >/dev/null 2>&1 || return 1
+  id="$(xdg-settings get default-web-browser 2>/dev/null)" || return 1
+  [[ -n "$id" ]] || return 1
+  for d in "$apps" /usr/share/applications /var/lib/snapd/desktop/applications \
+           /var/lib/flatpak/exports/share/applications \
+           "$apps/../flatpak/exports/share/applications"; do
+    [[ -f "$d/$id" ]] && { df="$d/$id"; break; }
+  done
+  [[ -n "${df:-}" ]] || return 1
+  exec="$(grep -m1 '^Exec=' "$df" 2>/dev/null || true)"
+  case "$exec" in *"/snap/"*|*"snap run"*|*flatpak*) return 0;; esac
+  return 1
+}
+# Note the cache is NOT ~/mdbrowse: the install instructions have you clone this repo
+# with `git clone …/mdbrowse.git`, which in $HOME lands exactly there — and the tool
+# would then scatter rendered pages through its own working tree.
+cache_dir() {
+  [[ -n "${MDBROWSE_CACHE:-}" ]] && { printf '%s' "$MDBROWSE_CACHE"; return; }
+  if confined_browser; then printf '%s' "$HOME/mdbrowse-cache"   # non-hidden: sandbox-readable
+  else printf '%s' "${XDG_CACHE_HOME:-$HOME/.cache}/mdbrowse"; fi
+}
+# Images larger than this are linked instead of inlined, so one huge picture can't
+# turn a small note into a page the browser struggles to load.
+MAXIMG="${MDBROWSE_MAX_IMAGE:-5242880}"   # 5 MiB
+
+die() { echo "mdbrowse: $*" >&2; exit 1; }
+
+MODE="open"
+case "${1:-}" in
+  --url)         MODE="url"; shift;;
+  --render-only) MODE="render"; shift;;
+  -h|--help|"") echo "usage: mdbrowse [--url|--render-only] FILE.md"; exit 0;;
+esac
+
+SRC="${1:-}"
+[[ -n "$SRC" ]] || die "no file given"
+[[ -f "$SRC" ]] || die "no such file: $SRC"
+[[ -f "$MARKED" && -f "$PURIFY" && -f "$GHCSS" ]] || die "missing bundled assets in $VENDOR"
+# Resolved here, not at startup: cache_dir() shells out to xdg-settings, and --help
+# and a bad filename have no business paying for a path they will never use.
+CACHE="$(cache_dir)"
+mkdir -p "$CACHE" || die "cannot create cache dir $CACHE"
+
+[[ "$MAXIMG" =~ ^[0-9]+$ ]] || die "MDBROWSE_MAX_IMAGE must be a plain byte count (got: $MAXIMG)"
+
+abspath() { printf '%s' "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; }
+outfor()  { printf '%s/%s.html' "$CACHE" "$(printf '%s' "$1" | md5sum | cut -c1-16)"; }
+esc_html() { local s=$1; s=${s//&/&amp;}; s=${s//</&lt;}; s=${s//>/&gt;}; printf '%s' "$s"; }
+
+# JSON string literal, for values emitted into the inline <script>. Escaping '<'
+# is what keeps a path like `dir</script>x.png` from closing the script element
+# and dropping its tail into the page as HTML, past DOMPurify. Control characters
+# are escaped too: a single raw one would be a JS syntax error, and since the maps
+# share the <script> with the renderer, that blanks the entire page.
+jsonstr() {
+  local s=$1 c out
+  # Fast path: nothing to escape. Worth having because the image payloads run
+  # through here too, and they are megabytes of base64 that never need touching.
+  if [[ "$s" != *[\\\"\<[:cntrl:]]* ]]; then printf '"%s"' "$s"; return; fi
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//</\\u003c}
+  if [[ "$s" == *[[:cntrl:]]* ]]; then
+    out=""
+    while [[ -n "$s" ]]; do
+      c=${s:0:1}; s=${s:1}
+      case "$c" in
+        $'\n') out+='\n';; $'\r') out+='\r';; $'\t') out+='\t';;
+        [[:cntrl:]]) out+="$(printf '\\u%04x' "'$c")";;
+        *) out+="$c";;
+      esac
+    done
+    s="$out"
+  fi
+  printf '"%s"' "$s"
+}
+
+# pctenc <string> <outvar>: percent-encode the characters that would otherwise end
+# a URL's path early — '%' first (so nothing gets encoded twice), then '#' and '?',
+# which start a fragment and a query, plus spaces.
+#
+# The result is written to the named variable rather than printed: these run once
+# per link, and a command substitution would fork for a job that is nothing but
+# parameter expansion. Naming the destination at the call site keeps that cheap
+# without the trap of a shared scratch variable.
+pctenc() {
+  local _p=$1
+  _p=${_p//\%/%25}; _p=${_p//\#/%23}; _p=${_p//\?/%3F}; _p=${_p// /%20}
+  printf -v "$2" '%s' "$_p"
+}
+
+# fileurl <path> <outvar>
+fileurl() { pctenc "$1" "$2"; printf -v "$2" 'file://%s' "${!2}"; }
+
+# True for anything that is not a path into the local filesystem: a URI with a
+# scheme (http:, mailto:, data:, …), a protocol-relative URL, or nothing at all.
+#
+# Unlike _absolute() in the emitted page, a leading '/' is NOT external here: the
+# page cannot know whether such a path is local, but this script can just look.
+#
+# The scheme test is a *guess*: a colon after a bare word looks exactly like a
+# scheme, so `chapter1:intro.md` reads as external even though it may well be a
+# file. Callers let an existing file win — see local_dest().
+is_external() {
+  case "$1" in
+    ""|//*) return 0;;
+    *) [[ "$1" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*: ]];;
+  esac
+}
+
+# md_candidates <dest>: the readings of a destination, longest first, into CANDS.
+# A '#' usually starts an anchor but is also a legal character in a filename, and
+# a file whose name contains one can still carry an anchor of its own:
+#   draft#2.md#intro  ->  "draft#2.md#intro" | "draft#2.md" | "draft"
+# The two cuts coincide unless there are 2+ of them, so the second is only added
+# when it actually differs — otherwise the caller would stat the same path twice.
+#
+# CANDS is consumed immediately by every caller, before render_one recurses and
+# overwrites it.
+declare -a CANDS=()
+md_candidates() {
+  CANDS=("$1")
+  [[ "$1" == *"#"*      ]] && CANDS+=("${1%#*}")     # cut at the last '#'
+  [[ "$1" == *"#"*"#"*  ]] && CANDS+=("${1%%#*}")    # cut at the first
+  return 0
+}
+
+# local_dest <dest> <dir>: true when the destination should be resolved on disk.
+# A scheme means "not a path" — unless a file by that name is sitting there, in
+# which case the document plainly meant the file. It reads a '#' exactly as the
+# resolver below does, so `chapter1:intro.md#sec` finds its file rather than being
+# written off as a URL.
+local_dest() {
+  is_external "$1" || return 0
+  case "$1" in data:*) return 1;; esac    # an inline payload is never a file on disk
+  local c
+  md_candidates "$1"
+  for c in "${CANDS[@]}"; do
+    [[ -f "$2/$c" ]] && return 0
+  done
+  return 1
+}
+
+# A markdown link/image destination as marked resolves it: without a trailing
+# "title" (or 'title') and without the optional <> wrapper, which is how a
+# destination containing spaces is legally written.
+destpath() {
+  local s=$1
+  s="${s%%+([[:space:]])\"*\"}"
+  s="${s%%+([[:space:]])\'*\'}"
+  s="${s##+([[:space:]])}"; s="${s%%+([[:space:]])}"
+  [[ "$s" == "<"*">" ]] && { s="${s#<}"; s="${s%>}"; }
+  printf '%s' "$s"
+}
+
+# The document minus fenced code blocks — an image or link shown as an *example* is
+# never rendered, so scanning it would rewrite links nobody can click and inline
+# pictures nobody sees. Two rules earn their keep here:
+#   * the opening marker is remembered, because a ``` inside a ~~~ block does not
+#     close it;
+#   * a fence must be indented by at most 3 spaces (CommonMark). Accepting any
+#     indentation meant a ``` shown *inside* an indented code sample opened a fake
+#     fence and swallowed the whole rest of the document.
+# Both mistakes fail the same catastrophic way: the scan silently ends early and
+# every link and image below it stops working.
+#
+# A leading YAML front matter block is dropped too, because the page drops it as well
+# (it becomes a table, never markdown) — scanning it would embed an image the reader
+# can never see. But only when it really is front matter: a bare `---` is also a
+# thematic break, so the block is buffered and only discarded once a `key: value` line
+# proves it. Anything ambiguous is printed back and gets scanned.
+#
+# Indented (4-space) code blocks are deliberately NOT filtered: telling one apart
+# from a list continuation needs a real block parser, and guessing wrong here would
+# stop rewriting genuine links. Over-scanning only costs bytes; under-scanning
+# breaks the page.
+#
+# A leading `---` block has to be buffered before we can tell front matter from a
+# thematic break, and the lines replayed out of that buffer must still go through the
+# fence rules — the first attempt let the front-matter branch swallow them with `next`,
+# which silently disabled fence filtering for the whole document. Routing every line,
+# buffered or not, through emit() makes that impossible to get wrong again.
+#
+# `[[:space:]]*` rather than `[ \t]*`, so a CRLF file's trailing \r does not hide the
+# marker from the scanner while the page, which tolerates it, strips the block: the two
+# sides have to read the same document.
+body_only() {
+  # "^ ? ? ?" rather than "^ {0,3}": interval expressions are not universal across awk
+  # implementations, and where they are missing the whole filter would silently no-op.
+  awk '
+    function emit(line) {
+      if (fence)                       { if (line ~ "^ ? ? ?" marker) fence = 0; return }
+      if (line ~ /^ ? ? ?```/)         { fence = 1; marker = "```"; return }
+      if (line ~ /^ ? ? ?~~~/)         { fence = 1; marker = "~~~"; return }
+      print line
+    }
+    NR == 1 && /^---[[:space:]]*$/ { fm = 1; buf[++n] = $0; next }
+    fm {
+      buf[++n] = $0
+      if ($0 ~ /^---[[:space:]]*$/) {              # block closed — was it front matter?
+        for (i = 1; i <= n; i++) if (buf[i] ~ /^[A-Za-z0-9_.-]+:/) yaml = 1
+        if (!yaml) for (i = 1; i <= n; i++) emit(buf[i])
+        fm = 0; n = 0
+      }
+      next
+    }
+    { emit($0) }
+    END { if (fm) for (i = 1; i <= n; i++) emit(buf[i]) }   # never closed: not front matter
+  ' "$1"
+}
+
+declare -A DONE   # abs source -> 1 (guards against cycles / duplicates)
+
+# render_one <abs existing .md>  -> writes $CACHE/<hash>.html (+ targets, recursively)
+render_one() {
+  local src=$1
+  [[ -n "${DONE[$src]:-}" ]] && return 0
+  DONE[$src]=1
+  local out dir title body
+  out="$(outfor "$src")"; dir="$(dirname "$src")"; title="$(basename "$src")"
+  body="$(body_only "$src")"            # read and de-fence the document once
+
+  # Both maps are keyed by the destination exactly as the document authored it.
+  # The browser looks the key up again after marked has percent-encoded it, so the
+  # spelling is reconciled there (see _mapget) rather than guessed at here.
+
+  # LINKMAP: .md destination -> file:// URL of its rendered HTML
+  local raw tgt cand abs anchor url frag
+  local -a links=()
+  while IFS= read -r raw; do
+    tgt="$(destpath "$raw")"
+    local_dest "$tgt" "$dir" || continue
+    [[ "$tgt" == \#* ]] && continue                   # a bare anchor into this page
+    # Take the longest reading of the destination that exists on disk.
+    md_candidates "$tgt"
+    abs=""
+    for cand in "${CANDS[@]}"; do
+      [[ "$cand" == *.md ]] || continue
+      case "$cand" in /*) abs="$cand";; *) abs="$dir/$cand";; esac
+      [[ -f "$abs" ]] && break
+      abs=""
+    done
+    [[ -n "$abs" ]] || continue
+    anchor="${tgt#"$cand"}"     # whatever followed the file name is the anchor
+    abs="$(abspath "$abs")"
+    render_one "$abs"
+    fileurl "$(outfor "$abs")" url
+    # The fragment is encoded on its own: it must keep its leading '#', which
+    # pctenc would otherwise escape into the path.
+    [[ -n "$anchor" ]] && { pctenc "${anchor#\#}" frag; url+="#$frag"; }
+    links+=("$(jsonstr "$tgt"):$(jsonstr "$url")")
+  done < <(grep -oE '\]\([^)]*\)' <<<"$body" | sed -E 's/^\]\(//; s/\)$//' | sort -u)
+
+  # IMGMAP: image destination -> index into IMGDATA, the list of data: URIs. The
+  # indirection means a file referenced under two spellings ("a.png", "./a.png")
+  # is encoded and carried once, not twice.
+  local isrc iabs imime ibytes ib64
+  local -a idata=() imgs=()
+  local -A iidx=()
+  while IFS= read -r raw; do
+    isrc="$(destpath "$raw")"                         # no #anchor strip: images have none
+    local_dest "$isrc" "$dir" || continue
+    case "$isrc" in /*) iabs="$isrc";; *) iabs="$dir/$isrc";; esac
+    [[ -f "$iabs" ]] || continue
+    case "${isrc,,}" in
+      *.png) imime=image/png;; *.jpg|*.jpeg) imime=image/jpeg;; *.gif) imime=image/gif;;
+      *.svg) imime=image/svg+xml;; *.webp) imime=image/webp;; *.avif) imime=image/avif;;
+      *.bmp) imime=image/bmp;; *.ico) imime=image/x-icon;;
+      *) continue;;                                   # unknown type -> file:// fallback
+    esac
+    iabs="$(abspath "$iabs")"
+    if [[ -z "${iidx[$iabs]:-}" ]]; then
+      # Every step below can fail on a file that exists but cannot be read. Each
+      # failure must fall through to the file:// link, never to a half-built
+      # data: URI — an empty payload renders as a broken image.
+      ibytes="$(wc -c < "$iabs" 2>/dev/null)" || continue
+      [[ "$ibytes" -le "$MAXIMG" ]] || continue        # too big to inline -> file:// fallback
+      ib64="$(base64 -w0 "$iabs" 2>/dev/null)" || continue
+      # Everything emitted into the <script> must be safe to sit inside a JS string.
+      # For the payloads that rule is checked rather than applied: base64 is a closed
+      # alphabet and imime comes from the whitelist above, so there is nothing to
+      # escape — and running megabytes through jsonstr would copy them four times.
+      # A glob, not =~: this walks a multi-megabyte string, and a pattern match does
+      # it without standing up a regex engine.
+      [[ -n "$ib64" && "$ib64" != *[!A-Za-z0-9+/=]* ]] || continue
+      idata+=("\"data:$imime;base64,$ib64\"")
+      iidx[$iabs]=$(( ${#idata[@]} - 1 ))
+    fi
+    imgs+=("$(jsonstr "$isrc"):${iidx[$iabs]}")
+  done < <({ grep -oE '!\[[^]]*\]\([^)]*\)' <<<"$body" | sed -E 's/^!\[[^]]*\]\(//; s/\)$//'
+            grep -oiE '<img[^>]+src=("[^"]*"|'\''[^'\'']*'\''|[^"'\'' >][^ >]*)' <<<"$body" \
+              | sed -E 's/.*[sS][rR][cC]=//; s/^"//; s/"$//; s/^'\''//; s/'\''$//'
+          } | sort -u)
+
+  # Join all three at one place, with IFS restored explicitly. `local IFS=,` inside a
+  # brace group looks scoped but is not — brace groups are not subshells, so it would
+  # stay in effect for the whole rest of this function.
+  local map imap payload oifs="$IFS"
+  IFS=,
+  map="{${links[*]}}"; imap="{${imgs[*]}}"; payload="${idata[*]}"
+  IFS="$oifs"
+
+  local etitle srcdir; etitle="$(esc_html "$title")"
+  {
+    printf '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+    printf '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+    printf '<title>%s</title>\n<style>\n' "$etitle"
+    cat "$GHCSS"
+    cat <<'CSS'
+  body{margin:0;background:#0d1117}
+  @media (prefers-color-scheme: light){body{background:#fff}}
+  .topbar{font:12px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    color:#7d8590;background:#161b22;border-bottom:1px solid #30363d;
+    padding:8px 16px;position:sticky;top:0;z-index:5;overflow-x:auto;white-space:nowrap}
+  @media (prefers-color-scheme: light){.topbar{color:#59636e;background:#f6f8fa;border-color:#d1d9e0}}
+  .topbar b{color:#e6edf3;font-weight:600}
+  @media (prefers-color-scheme: light){.topbar b{color:#1f2328}}
+  .markdown-body{box-sizing:border-box;min-width:200px;max-width:980px;margin:0 auto;padding:32px 45px 64px}
+  @media (max-width:767px){.markdown-body{padding:18px}}
+  /* YAML front matter, shown as a table the way GitHub shows it — muted, so it
+     frames the document instead of competing with it. */
+  .markdown-body table.frontmatter{display:table;width:100%;margin:0 0 24px;font-size:85%}
+  .markdown-body table.frontmatter th{text-align:left;white-space:nowrap;
+    vertical-align:top;color:#7d8590;font-weight:600;width:1%}
+  .markdown-body table.frontmatter td{color:#8b949e;word-break:break-word}
+  @media (prefers-color-scheme: light){
+    .markdown-body table.frontmatter th{color:#59636e}
+    .markdown-body table.frontmatter td{color:#656d76}
+  }
+CSS
+    printf '</style>\n</head>\n<body>\n'
+    printf '<div class="topbar"><b>%s</b> &nbsp;·&nbsp; %s &nbsp;·&nbsp; read-only</div>\n' \
+      "$etitle" "$(esc_html "$src")"
+    printf '<article class="markdown-body" id="content"></article>\n'
+    printf '<script>\n'
+    # The source is carried as base64 rather than embedded as text: a document that
+    # itself contains a </script> tag would otherwise end its own container, and
+    # escaping that tag corrupts the document (marked then reads the rest of the
+    # file as one unterminated HTML block and drops it). It is streamed straight
+    # from the encoder rather than captured, so no variable ever holds a copy.
+    printf 'var MD_B64="'; base64 -w0 "$src"; printf '";\n'
+    cat "$MARKED"
+    printf '\n'
+    cat "$PURIFY"
+    printf '\nvar LINKMAP=%s;\n' "$map"
+    printf 'var IMGMAP=%s;\n' "$imap"
+    printf 'var IMGDATA=[%s];\n' "$payload"
+    fileurl "$dir/" srcdir
+    printf 'var SRCDIR=%s;\n' "$(jsonstr "$srcdir")"
+    cat <<'JS'
+marked.setOptions({gfm:true, breaks:false});
+var _a=document.getElementById('content');
+var _md=new TextDecoder().decode(Uint8Array.from(atob(MD_B64), function(c){ return c.charCodeAt(0); }));
+
+// YAML front matter — the `---` block Hugo, Jekyll, Obsidian and plenty of note
+// systems put at the top. marked knows nothing about it: it reads the closing `---`
+// as a setext heading underline and turns the entire block into one giant <h2>.
+// GitHub renders it as a table, so do that: split it off before parsing.
+function _splitFrontMatter(md){
+  if(md.slice(0,3)!=='---') return [null, md];
+  var m=/^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(md);
+  return m ? [m[1], md.slice(m[0].length)] : [null, md];
+}
+// Key/value rows, not a YAML parser — a nested block is flattened to its raw text,
+// which is enough to read and has nothing to get wrong.
+function _frontMatterTable(yaml){
+  var lines=yaml.split(/\r?\n/), rows=[], i, m, val, buf;
+  for(i=0;i<lines.length;i++){
+    m=/^([A-Za-z0-9_.\-]+):[ \t]*(.*)$/.exec(lines[i]);
+    if(!m) continue;
+    val=m[2];
+    if(val===''){                       // a nested block: fold its indented lines in
+      buf=[];
+      while(i+1<lines.length && /^\s+\S/.test(lines[i+1])) buf.push(lines[++i].trim());
+      val=buf.join(' · ');
+    }
+    rows.push([m[1], val]);
+  }
+  if(!rows.length) return null;
+  var t=document.createElement('table'), tb=document.createElement('tbody');
+  t.className='frontmatter';
+  rows.forEach(function(r){
+    var tr=document.createElement('tr'), th=document.createElement('th'), td=document.createElement('td');
+    th.textContent=r[0]; td.textContent=r[1];   // textContent, so this needs no sanitizing
+    tr.appendChild(th); tr.appendChild(td); tb.appendChild(tr);
+  });
+  t.appendChild(tb);
+  return t;
+}
+// A leading `---` is not necessarily front matter — it is also just a thematic break.
+// If the block holds no `key: value` lines we are looking at a horizontal rule and the
+// text below it, so hand the document back untouched. Stripping it and then failing to
+// build a table would delete that text from the page without a trace.
+var _fm=_splitFrontMatter(_md);
+var _fmt=_fm[0]!==null ? _frontMatterTable(_fm[0]) : null;
+var _body=_fmt ? _fm[1] : _md;
+// Markdown may carry raw HTML, and this page runs on a file:// origin — sanitize
+// before anything reaches the DOM.
+_a.innerHTML = DOMPurify.sanitize(marked.parse(_body));
+if(_fmt) _a.insertBefore(_fmt, _a.firstChild);
+// marked emits headings without an id, so a link to `notes.md#section` would land at
+// the top of the page instead of the section. Rebuild GitHub-style slugs, keeping
+// accented letters (a Czech heading must not slugify down to its ASCII skeleton).
+(function(){
+  // Built with new RegExp, not a literal: \p{...} is validated when the script is
+  // PARSED, so on an engine that lacks it a literal would be a syntax error that
+  // takes the whole render down with it. This way the worst case is an ASCII-only
+  // slug — a missing anchor, not a blank page.
+  // \p{M} keeps combining marks: a heading pasted from macOS is NFD-decomposed, so
+  // "ě" arrives as "e" + a combining caron. Dropping marks would slug it to "e" —
+  // the ASCII collapse this is here to prevent, just via the back door.
+  var strip;
+  try { strip = new RegExp('[^\\p{L}\\p{M}\\p{N}_\\- ]+', 'gu'); }
+  catch (e) { strip = /[^A-Za-z0-9_\- ]+/g; }
+  var seen = Object.create(null);   // a heading called "Constructor" must not collide
+  _a.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function(h){
+    if(h.id) return;
+    // Each space becomes one hyphen — runs are NOT collapsed, because github-slugger
+    // does not collapse them either: "Install & Usage" loses the '&' and keeps both
+    // surrounding spaces, giving #install--usage. Collapsing here would break every
+    // anchor pasted from GitHub.
+    var base=(h.textContent||'').trim().toLowerCase()
+      .replace(strip,'').replace(/ /g,'-');
+    if(!base) return;
+    var id=base, n=1;
+    while(seen[id]) id=base+'-'+(n++);
+    seen[id]=1; h.id=id;
+  });
+})();
+function _absolute(u){ return /^[a-z][a-z0-9+.-]*:/i.test(u) || u.charAt(0)==='/' || u.slice(0,2)==='//'; }
+// The maps are keyed by the path as the document wrote it, but marked percent-encodes
+// the href/src it emits — so `pics/šmoula.png` comes back as `pics/%C5%A1moula.png` and
+// `my pic.png` as `my%20pic.png`. Decode before giving up on a key.
+function _mapget(map, s){
+  if(Object.prototype.hasOwnProperty.call(map, s)) return map[s];
+  var alt=[];
+  try { alt.push(decodeURI(s)); } catch(e) {}
+  try { alt.push(decodeURIComponent(s)); } catch(e) {}   // also decodes %23 (#), which decodeURI keeps
+  for(var i=0;i<alt.length;i++){
+    if(Object.prototype.hasOwnProperty.call(map, alt[i])) return map[alt[i]];
+  }
+  return undefined;
+}
+// The rewrites below must stay AFTER the sanitize call: DOMPurify strips file: URIs,
+// so the file:// links and images we inject would not survive it.
+_a.querySelectorAll('a[href]').forEach(function(a){
+  var v=_mapget(LINKMAP, a.getAttribute('href'));
+  if(v!==undefined) a.setAttribute('href', v);
+});
+// Images: use the payload we embedded, whatever the src looked like. The lookup has
+// to come BEFORE the _absolute test — the script resolves an absolute path like
+// /home/me/pic.png perfectly well and embeds it, and bailing out on the leading '/'
+// here would leave that payload sitting in the page unread while the browser went
+// back to the disk for it.
+// Anything we did not embed and that is not already absolute is relative to the
+// source dir, not to the cache dir the page lives in.
+_a.querySelectorAll('img[src]').forEach(function(img){
+  var s=img.getAttribute('src');
+  if(!s) return;
+  var i=_mapget(IMGMAP, s);
+  if(i!==undefined){ img.setAttribute('src', IMGDATA[i]); return; }
+  if(_absolute(s)) return;
+  img.setAttribute('src', SRCDIR + s);
+});
+JS
+    printf '</script>\n</body>\n</html>\n'
+  } > "$out"
+}
+
+SRC="$(abspath "$SRC")"
+render_one "$SRC"
+OUT="$(outfor "$SRC")"
+
+case "$MODE" in
+  render) printf '%s\n' "$OUT";;
+  url)    fileurl "$OUT" OUTURL; printf '%s\n' "$OUTURL";;
+  open)
+    if [[ -n "${BROWSER:-}" ]]; then "$BROWSER" "$OUT" >/dev/null 2>&1 &
+    elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$OUT" >/dev/null 2>&1 &
+    elif command -v open >/dev/null 2>&1; then open "$OUT" >/dev/null 2>&1 &   # macOS
+    else die "no opener found (set \$BROWSER or install xdg-open); file: $OUT"; fi
+    echo "mdbrowse -> $OUT";;
+esac
