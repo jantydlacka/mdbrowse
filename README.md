@@ -1,7 +1,11 @@
 # mdbrowse
 
 **Double-click a `.md` file and read it, rendered like GitHub.** That's it.
-One bash script, no install, read-only, fully offline.
+One bash script, no dependencies, read-only, fully offline.
+
+```sh
+git clone https://github.com/jantydlacka/mdbrowse.git && cd mdbrowse && ./install.sh
+```
 
 ![A raw .md file rendered by mdbrowse into a GitHub-styled page](docs/demo.gif)
 
