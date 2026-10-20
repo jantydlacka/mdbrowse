@@ -33,12 +33,13 @@ MARKED="$VENDOR/marked.min.js"
 PURIFY="$VENDOR/purify.min.js"
 GHCSS="$VENDOR/github-markdown.css"
 
-# A Snap/Flatpak browser runs in a sandbox that cannot read hidden directories, and
-# the XDG cache ($HOME/.cache/…) is hidden. Rendering there and handing the browser a
-# path it is not allowed to open is the one way this tool can fail while looking like
-# it worked — so when the default browser is confined, keep the page somewhere it can
-# actually reach. Costs one xdg-settings call (~15 ms) and saves the user from having
-# to know any of this.
+# A Snap browser's sandbox can't read hidden folders directly in $HOME, and the XDG
+# cache ($HOME/.cache/…) is one. Rendering there and handing the browser a path it is
+# not allowed to open is the one way this tool can fail while looking like it worked —
+# so when the default browser is confined, keep the page somewhere it can actually
+# reach. Flatpak is treated the same, but its sandbox can be stricter and may not
+# reach ~/mdbrowse-cache either (untested). Costs one xdg-settings call (~15 ms) and
+# saves the user from having to know any of this.
 confined_browser() {
   local id df exec d apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   command -v xdg-settings >/dev/null 2>&1 || return 1
@@ -59,7 +60,7 @@ confined_browser() {
 # would then scatter rendered pages through its own working tree.
 cache_dir() {
   [[ -n "${MDBROWSE_CACHE:-}" ]] && { printf '%s' "$MDBROWSE_CACHE"; return; }
-  if confined_browser; then printf '%s' "$HOME/mdbrowse-cache"   # non-hidden: sandbox-readable
+  if confined_browser; then printf '%s' "$HOME/mdbrowse-cache"   # non-hidden: readable from a Snap sandbox
   else printf '%s' "${XDG_CACHE_HOME:-$HOME/.cache}/mdbrowse"; fi
 }
 # Images larger than this are linked instead of inlined, so one huge picture can't
